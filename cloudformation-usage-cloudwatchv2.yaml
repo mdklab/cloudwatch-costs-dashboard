@@ -1,0 +1,1114 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Template to create Amazon CloudWatch dashboard for common areas of higher cost. Once your stack is created, go to the CloudWatch Console and explore the dashboard called 'CloudWatch-Costs-'<StackName>. **WARNING** This template creates an Amazon CloudWatch Dashboard, AWS Lambda functions and related resources. You will be billed for the AWS resources used if you create a stack from this template. This is a sample CloudFormation to demonstrate what is possible. You should review this code for your needs and it is best practice to enable x-Ray in upstream services to enable tracing (https://docs.aws.amazon.com/xray/latest/devguide/xray-services.html) and to use KMS to encrypt Lambda function log data (https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/encrypt-log-data-kms.html).
+
+Parameters:
+  TagName:
+    Description: Name of tag to be added to resources (Lambda functions, IAM roles, Log groups)
+    Type: String
+    Default: BlogExample
+  TagValue:
+    Description: Value of tag to be added to resources (Lambda functions, IAM roles, Log groups)
+    Type: String
+    Default: CloudWatchCostsDashboard
+    
+Resources:
+  LambdaFunctionCWCostExplorer:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup1
+    Properties:
+      Code:
+        ZipFile: |
+            // CloudWatch Custom Widget: display Cost Explorer report
+            const aws = require('aws-sdk');
+
+            const DOCS = `## Display Cost Explorer report
+            Displays a report for the specified service, showing costs for the specified service, for selected time range grouped by displayType.
+            displayType: Usage_Type, Region, Linked_Account
+            service: AWS Config, AmazonCloudWatch etc. (check how they appear in Cost Explorer - case sensitive)`;
+
+
+            // for HTML output display: colours for bar/table display and CSS
+            const PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', 
+            '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5', '#c49c94', '#f7b6d2', '#c7c7c7', '#dbdb8d', '#9edae5' ];
+            const CSS = `
+                <style>
+                    table{width:100%}
+                    td,th{
+                        font-family:Amazon Ember,Helvetica Neue,Roboto,Arial,sans-serif;
+                        font-size:14px;
+                        white-space:nowrap;
+                        text-align:center;
+                        padding:3px;
+                        border-bottom:1px solid #f2f2f2;
+                    }
+                    td:first-child{
+                        text-align:right;
+                        width:1px;
+                    }
+                    td:nth-child(2){
+                        width:1px;
+                        font-weight:700;
+                    }
+                    td div{
+                        border-radius:6px;
+                        height:18px;
+                    }
+                    tr:hover{
+                        background:#fbf8e9!important;transition:all .1s ease-in-out
+                    }
+                    th{
+                        text-align:center;
+                        border-bottom:1px solid #ccc;
+                        background-color:#fafafa;
+                        height:40px;
+                    }
+                    .cwdb-theme-dark td,.cwdb-theme-dark th{
+                        color:white;
+                        background-color:#2A2E33;
+                    }
+                    div.date{
+                        display:inline-block;
+                        font-weight:normal;
+                        font-size:smaller
+                    }
+                </style>`;
+
+            const getResults = async (start, end, displayType, service, dataType) => {
+                // https://aws.amazon.com/premiumsupport/knowledge-center/cloudwatch-understand-and-reduce-charges/
+                const ce = new aws.CostExplorer({ region: 'us-east-1' });
+                let NextPageToken = null;
+                let costs = [];
+                
+                do {    // paginate until no next page token
+                    const params = { 
+                        TimePeriod: { 
+                            Start: start, 
+                            End: end 
+                        }, 
+                        Granularity: 'MONTHLY', 
+                        "Filter": { 
+                            "Dimensions": { 
+                                "Key": "SERVICE", 
+                                "Values": [ service ] 
+                            } 
+                        }, 
+                        GroupBy: [ 
+                            { 
+                                Type: 'DIMENSION', 
+                                Key: displayType.toUpperCase() 
+                            } 
+                        ], 
+                        Metrics: [ dataType ], 
+                        NextPageToken 
+                    };
+                    // https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/CostExplorer.html#getCostAndUsage-property
+
+                    const response = await ce.getCostAndUsage(params).promise();
+
+                    // console.log(response);
+
+                    costs = costs.concat(response.ResultsByTime);
+                    NextPageToken = response.NextPageToken;
+                } while (NextPageToken);
+
+                return costs;
+            };
+
+            const tableStart = (totalData, start, end, displayType, service, dataType) => {
+                let unitDisplay = '$' // default for UnblendedCosts (or other costs)
+                let unitText = 'Total Cost'
+                if (dataType == 'UsageQuantity') {
+                    unitDisplay = ''
+                    unitText = 'Total Usage'
+                }            
+                return `<table class="cwdb-no-default-styles">
+                    <thead>
+                        <tr>
+                            <th>${service}:<br/>${displayType}</th>
+                            <th colspan=2><a href="/cost-management/home?region=${process.env.AWS_REGION}#/dashboard" target=_blank>${unitText}: ${unitDisplay}${totalData.toLocaleString(undefined, {maximumFractionDigits: 2, minimumFractionDigits: 2 })}</a> 
+                            <div class="date">(Search from ${start} to ${end})</div></th>
+                        </tr>
+                    </thead>`;
+            };
+
+            const collate = (costResults, dataType, optionalFilter) => {
+                const scs = {};
+
+                let totalData = 0;
+                costResults.forEach(result => {
+                    result.Groups.forEach(group => {
+                        const groupValue = group.Keys[0];
+                        // filter the data if a filter was provided
+                        // a filter can have multiple, space separated values
+                        for(let optionalFilterItem of optionalFilter.split(" ")){
+                            if (!optionalFilterItem || groupValue.indexOf(optionalFilterItem) > -1) {
+                                let groupCost = scs[groupValue] || 0;
+                                let currentDayCost = parseFloat(group.Metrics[dataType].Amount) || 0;
+                                totalData += currentDayCost;
+                                groupCost += parseFloat(group.Metrics[dataType].Amount);
+                                scs[groupValue] = groupCost;
+                            }
+                        }
+                    });
+                });
+                const sortedscs = Object.entries(scs).sort(([,a],[,b]) => b-a);
+                const maxgroupData = Math.max(...sortedscs.map(cost => cost[1]));
+                return { totalData, groupData: sortedscs, maxgroupData };
+            };
+
+            const getResultsHtml = (costResults, start, end, displayType, service, dataType, optionalFilter) => {
+                let unitDisplay = '$' // default for UnblendedCosts (or other costs)
+                if (dataType == 'UsageQuantity') {
+                    unitDisplay = ''
+                }
+
+                costResults.sort((a, b) => a.TimePeriod.Start.localeCompare(b.TimePeriod.Start));
+                const  { totalData, groupData, maxgroupData } = collate(costResults, dataType, optionalFilter);
+                let html = tableStart(totalData, start, end, displayType, service, dataType);
+
+                groupData.forEach((groupEntry, i) => {
+                    const [ UsageType, UsageTypeData ] = groupEntry;
+                    const percent = (UsageTypeData / totalData * 100).toFixed(2);
+                    const maxPercent = (UsageTypeData / maxgroupData * 100).toFixed(2);
+                    const color = PALETTE[i % PALETTE.length];
+                    html += `
+                        <tr>
+                            <td>${UsageType}</td>
+                            <td title="${percent}%">${unitDisplay}${UsageTypeData.toLocaleString(undefined, {maximumFractionDigits: 2, minimumFractionDigits: 2 })}</td>
+                            <td title="${percent}%"><div style="background-color: ${color}; width: ${maxPercent}%;"></div></td>
+                        </tr>`;
+                });
+                return `${html}</table>`;
+            };
+
+            exports.handler = async (event) => {
+                if (event.describe) {
+                    return DOCS;
+                }
+                const widgetContext = event.widgetContext;
+
+                let displayType = widgetContext.params.displayType;
+                if (typeof displayType === "undefined") {
+                    displayType = 'Usage_Type';
+                }
+
+                let service = widgetContext.params.service;
+                if (typeof service === "undefined") {
+                    return "<br/><br/><b>Error:</b>service must be defined in custom widget configuration."
+                }
+                
+                let dataType = widgetContext.params.dataType;
+                if (typeof dataType === "undefined") {
+                    return "<br/><br/><b>Error:</b>dataType must be defined in custom widget configuration."
+                }                
+
+                let optionalFilter = widgetContext.params.optionalFilter || '';
+
+                const timeRange = widgetContext.timeRange.zoom || widgetContext.timeRange;
+                const start = timeRange.start;
+                const end = timeRange.end;
+                const minTimeDiff = Math.max(end - start, 24 * 60 * 60 * 1000);
+                const newStart = end - minTimeDiff;
+                const startStr = new Date(newStart).toISOString().split('T')[0];
+                const endStr = new Date(end).toISOString().split('T')[0];
+                const dailyCosts = await getResults(startStr, endStr, displayType, service, dataType);
+                return CSS + getResultsHtml(dailyCosts, startStr, endStr, displayType, service, dataType, optionalFilter);
+            };
+      Description: 'CloudWatch Custom Widget: Cost Explorer report'
+      FunctionName: !Sub CustomWidgetCostExplorer-js-${AWS::StackName}
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaIAMRole1.Arn
+      Runtime: nodejs16.x
+      Timeout: 60
+      Tags:
+        - Key: !Ref TagName
+          Value: !Ref TagValue
+
+  LambdaFunctionCWLogStorage:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup2
+    Properties:
+      Code:
+        ZipFile: |
+            // CloudWatch Custom Widget: display CloudWatch log storage
+            const aws = require('aws-sdk');
+
+            const DOCS = `## Display CloudWatch log Volume stored
+            Displays a report on volume (GB) of each CloudWatch log group for the selected time range.`;
+
+            // for HTML output display: colours for bar/table display and CSS
+            const PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', 
+            '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5', '#c49c94', '#f7b6d2', '#c7c7c7', '#dbdb8d', '#9edae5' ];
+
+            const CSS = `
+                <style>
+                    table{width:100%}
+                    td,th{
+                        font-family:Amazon Ember,Helvetica Neue,Roboto,Arial,sans-serif;
+                        font-size:14px;
+                        white-space:nowrap;
+                        text-align:center;
+                        padding:3px;
+                        border-bottom:1px solid #f2f2f2;
+                    }
+                    td:first-child{
+                        text-align:right;
+                        width:1px;
+                    }
+                    td:nth-child(2), td:nth-child(3), td:nth-child(5){
+                        width:1px;
+                        font-weight:700;
+                    }
+                    td div{
+                        border-radius:6px;
+                        height:18px;
+                    }
+                    tr:hover{
+                        background:#fbf8e9!important;
+                        transition:all .1s ease-in-out;
+                    }
+                    th{
+                        text-align:center;
+                        border-bottom:1px solid #ccc;
+                        background-color:#fafafa;
+                        height:40px;
+                    }
+                    .cwdb-theme-dark td,.cwdb-theme-dark th{
+                        color:white;
+                        background-color:#2A2E33;
+                    }
+                </style>
+            `;
+
+            // list of regions without opt-in as of June 2022
+            const regions = [ 'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'ca-central-1', 'ap-south-1', 'ap-northeast-1', 
+            'ap-northeast-2', 'ap-northeast-3', 'ap-southeast-1', 'ap-southeast-2', 'eu-central-1', 'eu-west-1', 'eu-west-2', 
+            'eu-west-3', 'eu-north-1', 'sa-east-1' ];
+
+            // Log groups names are only unique to a region, so add region so these are kept separated
+            const addRegionToLogGroups = (region, logGroups) => {
+                logGroups.forEach(logGroup => {
+                    logGroup.region = region;
+                })
+            }
+
+            // get data about all logs in each region
+            const getLogGroups = async (region) => {
+                // region defines the region we will get results from
+                const cwl = new aws.CloudWatchLogs({ region: region });
+                let NextPageToken = null;
+                let logGroups = [];
+
+                // get list of all logGroups and loop through paginated response until no next page token
+                do {
+                    const params = { nextToken: NextPageToken }; // don't specify the logGroupNamePrefix and will return all log groups
+                    // https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/CloudWatchLogs.html#describeLogGroups-property
+                    const response = await cwl.describeLogGroups(params).promise();
+                    
+                    // combine results into a single array
+                    logGroups = logGroups.concat(response.logGroups);
+                    NextPageToken = response.nextToken;
+                } while (NextPageToken);
+                
+                return logGroups;
+            };
+
+            // for HTML output display: start of HTML table with styles and headers
+            const tableStart = (totalVolume) => {
+                return `<table class="cwdb-no-default-styles">
+                            <thead>
+                                <tr>
+                                    <th>LogGroup</th>
+                                    <th>Region</th>
+                                    <th colspan=2>Total Volume: ${totalVolume.toFixed(2)} GB</th><th>% of Total Volume</th>
+                                </tr>
+                            </thead>`;
+            };
+
+            // pull out the logGroupName, region and stored volume 
+            const getLogGroupVolumeGB = (logGroups) => {
+                let totalVolumeBytes = 0;
+                let logGroupRegionVolume = [];
+
+                // go through each log group and get storage volume
+                logGroups.forEach(result => {
+                    totalVolumeBytes += result.storedBytes;
+                    
+                    // log group names have to be unique within a region, so create unique id to allow multi region search
+                    const logGroupId = `${result.logGroupName}:${result.region}`;
+                    
+                    // add data to results array (convert bytes to GB)
+                    logGroupRegionVolume.push( { 
+                        id: logGroupId, 
+                        name: result.logGroupName, 
+                        GB: result.storedBytes / 1000000000, 
+                        region: result.region 
+                    } );
+                });
+
+                const VolumeGB = totalVolumeBytes / 1000000000;
+                return { VolumeGB, logGroupRegionVolume };
+            };
+
+            // we only want top 10 overall - use this to get top 10 by region, and overall
+            const getTopXByVolume = (logGroups, size) => {
+                if (logGroups.length < size) {
+                    size = logGroups.length
+                }
+                
+                // sort by cost, largest to smallest              
+                const sortedLogGroups = logGroups.sort((a,b) => b.GB - a.GB);
+
+                return sortedLogGroups.slice(0, size);
+            }
+
+            // for HTML output display: create table for the bar/table display
+            const getLogGroupsHtml = (totalVolumeGB, sortedLogGroupsRegion) => {
+                // find max (so we can display results in relation to max value)
+                const maxLogVolumeGB = sortedLogGroupsRegion[0].GB;
+
+                let html = tableStart(totalVolumeGB);
+
+                // create each row, sizing bar to max value
+                sortedLogGroupsRegion.forEach((logGroupEntry, i) => {
+                    const logGroupName = logGroupEntry.name;
+                    const logGroupRegion = logGroupEntry.region;
+                    const logGroupVolume = logGroupEntry.GB;
+                    const percent = (logGroupVolume / totalVolumeGB * 100).toFixed(2);
+                    const maxPercent = ( logGroupVolume / maxLogVolumeGB * 100).toFixed(2);
+                    const color = PALETTE[i % PALETTE.length];
+                    html += `<tr>
+                                <td>${logGroupName}</td>
+                                <td>${logGroupRegion}</td>
+                                <td title="${percent}%">${logGroupVolume.toFixed(2)} GB </td>
+                                <td title="${percent}%"><div style="background-color: ${color}; width: ${maxPercent}%;"></div></td>
+                                <td>${percent} %</td>
+                            </tr>`;
+                });
+                return `${html}</table>`;
+            };
+
+            exports.handler = async (event) => {
+                if (event.describe) {
+                    return DOCS;
+                }
+                let result = false;
+                let mylogGroups = [];
+                let myRegionlogGroupsVolume = [];
+                let mylogGroupsVolume = [];
+                let myToplogGroupsVolume = [];
+                let totalVolumeGB = 0;
+
+                // getting top 10 log groups per region by volume, then using this to get top 10 overall
+                const size = 10; 
+
+                for (let region of regions) {
+                    mylogGroups =  await getLogGroups(region);
+                    addRegionToLogGroups(region, mylogGroups);
+                    const { VolumeGB, logGroupRegionVolume } = getLogGroupVolumeGB(mylogGroups);
+                    totalVolumeGB += VolumeGB;
+                    myRegionlogGroupsVolume = getTopXByVolume(logGroupRegionVolume, size);
+                    mylogGroupsVolume = mylogGroupsVolume.concat(myRegionlogGroupsVolume);
+                }
+
+                myToplogGroupsVolume = getTopXByVolume(mylogGroupsVolume, size);
+
+                return CSS + getLogGroupsHtml(totalVolumeGB, myToplogGroupsVolume);
+            };
+      Description: 'CloudWatch Custom Widget: CloudWatch Log Storage report'
+      FunctionName: !Sub CustomWidgetLogStorageVolume-js-${AWS::StackName}
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaIAMRole2.Arn
+      Runtime: nodejs16.x
+      Timeout: 60
+      Tags:
+        - Key: !Ref TagName
+          Value: !Ref TagValue
+
+  LambdaIAMRole1:
+    Type: AWS::IAM::Role
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/CustomWidgetCostExplorer-js-${AWS::StackName}:*
+          PolicyName: CustomWidgetLambda
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - ce:GetCostAndUsage
+                Effect: Allow
+                Resource:
+                  - '*'
+          PolicyName: CostExplorerGetCostAndUsage
+      Tags:
+        - Key: !Ref TagName
+          Value: !Ref TagValue
+
+  LambdaIAMRole2:
+    Type: AWS::IAM::Role
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/CustomWidgetLogStorageVolume-js-${AWS::StackName}:*
+          PolicyName: CustomWidgetLambda
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:DescribeLogGroups
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:*:${AWS::AccountId}:*
+          PolicyName: CloudWatchLogsDescribeLogGroups
+      Tags:
+        - Key: !Ref TagName
+          Value: !Ref TagValue
+
+  LambdaLogGroup1:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/CustomWidgetCostExplorer-js-${AWS::StackName}
+      RetentionInDays: 7
+      Tags:
+        - Key: !Ref TagName
+          Value: !Ref TagValue
+
+  LambdaLogGroup2:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/CustomWidgetLogStorageVolume-js-${AWS::StackName}
+      RetentionInDays: 7
+      Tags:
+        - Key: !Ref TagName
+          Value: !Ref TagValue
+
+  CWLogsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub CloudWatch-Costs-${AWS::StackName}
+      DashboardBody:
+         !Sub
+          >
+            {
+                "start": "-PT168H",
+                "widgets": [
+                    {
+                        "height": 8,
+                        "width": 24,
+                        "y": 0,
+                        "x": 0,
+                        "type": "text",
+                        "properties": {
+                            "markdown": "# What is this dashboard for?\nThis dashboard is designed to give insights into CloudWatch costs. It is intended to support initial conversations about CloudWatch costs with customers, specifically in the area of log ingestion and storage, and Metric API calls.\n\nThe time charts views are to help customers identify their high cost areas, and see the impact of any changes made over time.\n\nThe dashboard shows \n* High level costs by linked account, region and usage type (as is also found in Cost Explorer).\n* Log Ingestion and storage at region level, and at the log group level over time.\n  * Event counts are shown as well as ingestion volume to help see where large volume comes form many small events.\n* Common metric API calls and top 10 metric API calls at a region level.\n\n\n# Aggregated data\nUnless otherwise stated in the widget title, where data is shown without a timechart display, it is the sum of that data during the dashboard search period (where this is more than a full day).\n\nApart from the initial widget showing cost by account, all other widgets only show data in the CURRENT account.\n"
+                        }
+                    },
+                    {
+                        "height": 3,
+                        "width": 24,
+                        "y": 0,
+                        "x": 0,
+                        "type": "text",
+                        "properties": {
+                            "markdown": "# Cost Explorer Data\nThe data in this section is available through AWS Cost Explorer. Within Cost Explorer you can filter and group on dimensions such as service, region and usage types. We have included them here to make it easy to use this information alongside the rest of the data in this dashboard.\n For more information about usage types and ways to analyze and reduce CloudWatch costs in other areas, see the AWS documentation on [CloudWatch billing and cost](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch_billing.html). "
+                        }
+                    },
+                    {
+                        "height": 6,
+                        "width": 6,
+                        "y": 11,
+                        "x": 0,
+                        "type": "custom",
+                        "properties": {
+                            "endpoint": "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:CustomWidgetCostExplorer-js-${AWS::StackName}",
+                            "updateOn": {
+                                "refresh": true,
+                                "resize": true,
+                                "timeRange": true
+                            },
+                            "params": {
+                                "displayType": "Linked_Account",
+                                "service": "AmazonCloudWatch",
+                                "dataType": "UnblendedCost"                                                 
+                            },
+                            "title": "CloudWatch Costs by Account, for all Regions - current month"
+                        }
+                    },
+                    {
+                        "height": 6,
+                        "width": 7,
+                        "y": 11,
+                        "x": 6,
+                        "type": "custom",
+                        "properties": {
+                            "endpoint": "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:CustomWidgetCostExplorer-js-${AWS::StackName}",
+                            "updateOn": {
+                                "refresh": true,
+                                "resize": true,
+                                "timeRange": true
+                            },
+                            "params": {
+                                "displayType": "Region",
+                                "service": "AmazonCloudWatch",
+                                "dataType": "UnblendedCost"                                                 
+                            },
+                            "title": "CloudWatch Costs by Region, for current Account - current month"
+                        }
+                    },
+                    {
+                        "height": 6,
+                        "width": 11,
+                        "y": 11,
+                        "x": 13,
+                        "type": "custom",
+                        "properties": {
+                            "endpoint": "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:CustomWidgetCostExplorer-js-${AWS::StackName}",
+                            "updateOn": {
+                                "refresh": true,
+                                "resize": true,
+                                "timeRange": true
+                            },
+                            "params": {
+                                "displayType": "Usage_Type",
+                                "service": "AmazonCloudWatch",
+                                "dataType": "UnblendedCost"                                                                             
+                            },
+                            "title": "CloudWatch Costs by Usage Type, for all Regions, for current Account  - current month"
+                        }
+                    },
+                    {
+                        "height": 3,
+                        "width": 24,
+                        "y": 17,
+                        "x": 0,
+                        "type": "text",
+                        "properties": {
+                            "markdown": "# Log Ingestion/Volume (GB)\n\nRegions are only visible if they do not require an opt-in - see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html .\n\nFor time charts below, to see only one region, or data series, click on the desired series in the legend. Click the same series in the legend again to show all series."
+                        }
+                    },
+                    {
+                        "height": 7,
+                        "width": 8,
+                        "y": 20,
+                        "x": 0,
+                        "type": "metric",
+                        "properties": {
+                            "metrics": [
+                                [ { "expression": "SUM(METRICS())/1000000000", "label": "All regions", "id": "e2" } ],
+                                [ { "expression": "METRICS()/1000000000", "label": "", "id": "e1", "region": "us-east-1"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m1", "region": "us-east-1", "visible": false, "label": "us-east-1"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m2", "region": "us-east-2", "visible": false, "label": "us-east-2"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m3", "region": "us-west-1", "visible": false, "label": "us-west-1"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m4", "region": "us-west-2", "visible": false, "label": "us-west-2"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m5", "region": "ca-central-1", "visible": false, "label": "ca-central-1"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m6", "region": "ap-south-1", "visible": false, "label": "ap-south-1"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m7", "region": "ap-northeast-1", "visible": false, "label": "ap-northeast-1"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m8", "region": "ap-northeast-2", "visible": false, "label": "ap-northeast-2"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m9", "region": "ap-northeast-3", "visible": false, "label": "ap-northeast-3"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m10", "region": "ap-southeast-1", "visible": false, "label": "ap-southeast-1"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m11", "region": "ap-southeast-2", "visible": false, "label": "ap-southeast-2"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m12", "region": "eu-central-1", "visible": false, "label": "eu-central-1"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m13", "region": "eu-west-1", "visible": false, "label": "eu-west-1"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m14", "region": "eu-west-2", "visible": false, "label": "eu-west-2"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m15", "region": "eu-west-3", "visible": false, "label": "eu-west-3"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m16", "region": "eu-north-1", "visible": false, "label": "eu-north-1"} ],
+                                [ "AWS/Logs", "IncomingBytes", { "id": "m17", "region": "sa-east-1", "visible": false, "label": "sa-east-1"} ]
+                            ],
+                            "sparkline": true,
+                            "view": "timeSeries",
+                            "stacked": false,
+                            "region": "${AWS::Region}",
+                            "stat": "Sum",
+                            "period": 86400,
+                            "setPeriodToTimeRange": true,
+                            "title": "Total Log Ingestion by Region: Volume (GB)",
+                            "annotations": {
+                                "horizontal": [
+                                    {
+                                        "visible": false,
+                                        "label": "threshold",
+                                        "value": 1.5
+                                    }
+                                ]
+                            },
+                            "yAxis": {
+                                "left": {
+                                    "showUnits": false,
+                                    "label": "GB"
+                                }
+                            },
+                            "legend": {
+                                "position": "right"
+                            }
+                        }
+                    },
+                    {
+                        "height": 7,
+                        "width": 16,
+                        "y": 20,
+                        "x": 8,
+                        "type": "metric",
+                        "properties": {
+                            "metrics": [
+                                [ { "expression": "SORT([e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17], MAX, DESC, 10)", "label": "[${!PROP('Region')}] ${!LABEL}", "id": "s1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e1", "visible": false, "region": "us-east-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e2", "visible": false, "region": "us-east-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e3", "visible": false, "region": "us-west-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e4", "visible": false, "region": "us-west-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e5", "visible": false, "region": "ca-central-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e6", "visible": false, "region": "ap-south-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e7", "visible": false, "region": "ap-northeast-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e8", "visible": false, "region": "ap-northeast-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e9", "visible": false, "region": "ap-northeast-3" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e10", "visible": false, "region": "ap-southeast-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e11", "visible": false, "region": "ap-southeast-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e12", "visible": false, "region": "eu-central-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e13", "visible": false, "region": "eu-west-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e14", "visible": false, "region": "eu-west-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e15", "visible": false, "region": "eu-west-3" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e16", "visible": false, "region": "eu-north-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e17", "visible": false, "region": "sa-east-1" } ]
+                            ],
+                            "sparkline": true,
+                            "view": "pie",
+                            "stacked": false,
+                            "region": "${AWS::Region}",
+                            "stat": "Sum",
+                            "period": 86400,
+                            "setPeriodToTimeRange": false,
+                            "title": "Top 10 Log Groups by Volume (GB): last full day",
+                            "legend": {
+                                "position": "right"
+                            }
+                        }
+                    },		
+                    {
+                        "height": 7,
+                        "width": 24,
+                        "y": 27,
+                        "x": 0,
+                        "type": "metric",
+                        "properties": {
+                            "metrics": [
+                                [ { "expression": "SORT([e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17], MAX, DESC, 10)", "label": "[${!PROP('Region')}] ${!LABEL}", "id": "s1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e1", "visible": false, "region": "us-east-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e2", "visible": false, "region": "us-east-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e3", "visible": false, "region": "us-west-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e4", "visible": false, "region": "us-west-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e5", "visible": false, "region": "ca-central-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e6", "visible": false, "region": "ap-south-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e7", "visible": false, "region": "ap-northeast-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e8", "visible": false, "region": "ap-northeast-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e9", "visible": false, "region": "ap-northeast-3" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e10", "visible": false, "region": "ap-southeast-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e11", "visible": false, "region": "ap-southeast-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e12", "visible": false, "region": "eu-central-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e13", "visible": false, "region": "eu-west-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e14", "visible": false, "region": "eu-west-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e15", "visible": false, "region": "eu-west-3" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e16", "visible": false, "region": "eu-north-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingBytes\"',\"Sum\",86400)/1000000000,MAX, DESC, 10)", "id": "e17", "visible": false, "region": "sa-east-1" } ]
+                            ],
+                            "sparkline": true,
+                            "view": "timeSeries",
+                            "stacked": false,
+                            "region": "${AWS::Region}",
+                            "stat": "Sum",
+                            "period": 86400,
+                            "setPeriodToTimeRange": true,
+                            "title": "Top 10 Log Groups by Volume (GB): daily total",
+                            "legend": {
+                                "position": "right"
+                            },
+                            "yAxis": {
+                                "left": {
+                                    "showUnits": false,
+                                    "label": "GB"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "height": 3,
+                        "width": 24,
+                        "y": 34,
+                        "x": 0,
+                        "type": "text",
+                        "properties": {
+                            "markdown": "# Log Ingestion/Log Event Count\n\nRegions are only visible if they do not require an opt-in - see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html .\n\nFor time charts below, to see only one region, or data series, click on the desired series in the legend. Click the same series in the legend again to show all series."
+                        }
+                    },
+                    {
+                        "height": 7,
+                        "width": 8,
+                        "y": 37,
+                        "x": 0,
+                        "type": "metric",
+                        "properties": {
+                            "metrics": [
+                                [ { "expression": "SUM(METRICS())", "label": "All Regions", "id": "e1" } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m1", "region": "us-east-1", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m2", "region": "us-east-2", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m3", "region": "us-west-1", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m4", "region": "us-west-2", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m5", "region": "ca-central-1", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m6", "region": "ap-south-1", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m7", "region": "ap-northeast-1", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m8", "region": "ap-northeast-2", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m9", "region": "ap-northeast-3", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m10", "region": "ap-southeast-1", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m11", "region": "ap-southeast-2", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m12", "region": "eu-central-1", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m13", "region": "eu-west-1", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m14", "region": "eu-west-2", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m15", "region": "eu-west-3", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m16", "region": "eu-north-1", "visible": true } ],
+                                [ "AWS/Logs", "IncomingLogEvents", { "id": "m17", "region": "sa-east-1", "visible": true } ]
+                            ],
+                            "sparkline": true,
+                            "view": "timeSeries",
+                            "stacked": false,
+                            "region": "${AWS::Region}",
+                            "stat": "Sum",
+                            "period": 86400,
+                            "setPeriodToTimeRange": true,
+                            "title": "Total Log Ingestion by Region: Log Event count",
+                            "legend": {
+                                "position": "right"
+                            },
+                            "yAxis": {
+                                "left": {
+                                    "showUnits": false,
+                                    "label": "Event Count"
+                                },
+                                "right": {
+                                    "showUnits": false
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "height": 7,
+                        "width": 16,
+                        "y": 37,
+                        "x": 8,
+                        "type": "metric",
+                        "properties": {
+                            "metrics": [
+                                [ { "expression": "SORT([e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17 ],MAX,DESC,10)", "label": "[${!PROP('Region')}] ${!LABEL}", "id": "s1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e1", "visible": false, "region": "us-east-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e2", "visible": false, "region": "us-east-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e3", "visible": false, "region": "us-west-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e4", "visible": false, "region": "us-west-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e5", "visible": false, "region": "ca-central-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e6", "visible": false, "region": "ap-south-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e7", "visible": false, "region": "ap-northeast-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e8", "visible": false, "region": "ap-northeast-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e9", "visible": false, "region": "ap-northeast-3" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e10", "visible": false, "region": "ap-southeast-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e11", "visible": false, "region": "ap-southeast-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e12", "visible": false, "region": "eu-central-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e13", "visible": false, "region": "eu-west-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e14", "visible": false, "region": "eu-west-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e15", "visible": false, "region": "eu-west-3" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e16", "visible": false, "region": "eu-north-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e17", "visible": false, "region": "sa-east-1" } ]
+                            ],
+                            "sparkline": true,
+                            "view": "pie",
+                            "stacked": false,
+                            "region": "${AWS::Region}",
+                            "stat": "Sum",
+                            "period": 86400,
+                            "setPeriodToTimeRange": false,
+                            "title": "Top 10 Log Groups by event count: last full day",
+                            "legend": {
+                                "position": "right"
+                            }
+                        }
+                    },
+                    {
+                        "height": 7,
+                        "width": 24,
+                        "y": 44,
+                        "x": 0,
+                        "type": "metric",
+                        "properties": {
+                            "metrics": [
+                                [ { "expression": "SORT([e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17 ],MAX,DESC,10)", "label": "[${!PROP('Region')}] ${!LABEL}", "id": "s1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e1", "visible": false, "region": "us-east-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e2", "visible": false, "region": "us-east-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e3", "visible": false, "region": "us-west-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e4", "visible": false, "region": "us-west-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e5", "visible": false, "region": "ca-central-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e6", "visible": false, "region": "ap-south-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e7", "visible": false, "region": "ap-northeast-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e8", "visible": false, "region": "ap-northeast-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e9", "visible": false, "region": "ap-northeast-3" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e10", "visible": false, "region": "ap-southeast-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e11", "visible": false, "region": "ap-southeast-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e12", "visible": false, "region": "eu-central-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e13", "visible": false, "region": "eu-west-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e14", "visible": false, "region": "eu-west-2" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e15", "visible": false, "region": "eu-west-3" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e16", "visible": false, "region": "eu-north-1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Logs,LogGroupName} MetricName=\"IncomingLogEvents\"',\"Sum\",86400),MAX, DESC, 10)", "id": "e17", "visible": false, "region": "sa-east-1" } ]
+                            ],
+                            "sparkline": true,
+                            "view": "timeSeries",
+                            "stacked": false,
+                            "region": "${AWS::Region}",
+                            "stat": "Sum",
+                            "period": 86400,
+                            "setPeriodToTimeRange": true,
+                            "title": "Top 10 Log Groups by event count: daily total",
+                            "legend": {
+                                "position": "right"
+                            },
+                            "yAxis": {
+                                "left": {
+                                    "showUnits": false,
+                                    "label": "Event Count"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "height": 2,
+                        "width": 24,
+                        "y": 51,
+                        "x": 0,
+                        "type": "text",
+                        "properties": {
+                            "markdown": "# Log Storage"
+                        }
+                    },
+                    {
+                        "height": 8,
+                        "width": 24,
+                        "y": 53,
+                        "x": 0,
+                        "type": "custom",
+                        "properties": {
+                            "endpoint": "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:CustomWidgetLogStorageVolume-js-${AWS::StackName}",
+                            "updateOn": {
+                                "refresh": true,
+                                "resize": true,
+                                "timeRange": true
+                            },
+                            "title": "Top 10: Current Storage Volume by Log Group, for all Regions"
+                        }
+                    },
+                    {
+                        "height": 2,
+                        "width": 24,
+                        "y": 61,
+                        "x": 0,
+                        "type": "text",
+                        "properties": {
+                            "markdown": "# API Usage\nThere are a number of API calls that can be made for Metrics - here you see those which are typically used the most."
+                        }
+                    },
+                    {
+                        "height": 7,
+                        "width": 8,
+                        "y": 63,
+                        "x": 0,
+                        "type": "metric",
+                        "properties": {
+                            "metrics": [
+                                [ { "expression": "SUM(METRICS())", "label": "All Regions", "id": "e1" } ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m1" , "region": "us-east-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m2" , "region": "us-east-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m3" , "region": "us-west-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m4" , "region": "us-west-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m5" , "region": "ca-central-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m6" , "region": "ap-south-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m7" , "region": "ap-northeast-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m8" , "region": "ap-northeast-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m9" , "region": "ap-northeast-3", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m10" , "region": "ap-southeast-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m11" , "region": "ap-southeast-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m12" , "region": "eu-central-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m13" , "region": "eu-west-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m14" , "region": "eu-west-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m15" , "region": "eu-west-3", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m16" , "region": "eu-north-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m17" , "region": "sa-east-1", "visible": true} ]
+                            ],
+                            "view": "timeSeries",
+                            "stacked": false,
+                            "region": "${AWS::Region}",
+                            "stat": "Sum",
+                            "period": 300,
+                            "title": "GetMetricData API Call Volume by Region",
+                            "yAxis": {
+                                "left": {
+                                    "showUnits": false,
+                                    "label": "count"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "height": 7,
+                        "width": 8,
+                        "y": 63,
+                        "x": 8,
+                        "type": "metric",
+                        "properties": {
+                            "metrics": [
+                                [ { "expression": "SUM(METRICS())", "label": "All Regions", "id": "e1" } ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m1" , "region": "us-east-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m2" , "region": "us-east-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m3" , "region": "us-west-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m4" , "region": "us-west-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m5" , "region": "ca-central-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m6" , "region": "ap-south-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m7" , "region": "ap-northeast-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m8" , "region": "ap-northeast-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m9" , "region": "ap-northeast-3", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m10" , "region": "ap-southeast-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m11" , "region": "ap-southeast-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m12" , "region": "eu-central-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m13" , "region": "eu-west-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m14" , "region": "eu-west-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m15" , "region": "eu-west-3", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m16" , "region": "eu-north-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "PutMetricData", "Service", "CloudWatch", "Class", "None", { "id": "m17" , "region": "sa-east-1", "visible": true} ]
+                            ],
+                            "view": "timeSeries",
+                            "stacked": false,
+                            "region": "${AWS::Region}",
+                            "stat": "Sum",
+                            "period": 300,
+                            "title": "PutMetricData API Call Volume by Region",
+                            "yAxis": {
+                                "left": {
+                                    "showUnits": false,
+                                    "label": "count"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "height": 7,
+                        "width": 8,
+                        "y": 63,
+                        "x": 16,
+                        "type": "metric",
+                        "properties": {
+                            "metrics": [
+                                [ { "expression": "SUM(METRICS())", "label": "All Regions", "id": "e1" } ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m1" , "region": "us-east-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m2" , "region": "us-east-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m3" , "region": "us-west-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m4" , "region": "us-west-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m5" , "region": "ca-central-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m6" , "region": "ap-south-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m7" , "region": "ap-northeast-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m8" , "region": "ap-northeast-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m9" , "region": "ap-northeast-3", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m10" , "region": "ap-southeast-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m11" , "region": "ap-southeast-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m12" , "region": "eu-central-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m13" , "region": "eu-west-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m14" , "region": "eu-west-2", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m15" , "region": "eu-west-3", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m16" , "region": "eu-north-1", "visible": true} ],
+                                [ "AWS/Usage", "CallCount", "Type", "API", "Resource", "GetMetricStatistics", "Service", "CloudWatch", "Class", "None", { "id": "m17" , "region": "sa-east-1", "visible": true} ]
+                            ],
+                            "view": "timeSeries",
+                            "stacked": false,
+                            "region": "${AWS::Region}",
+                            "stat": "Sum",
+                            "period": 300,
+                            "title": "GetMetricStatistics API Call Volume by Region",
+                            "yAxis": {
+                                "left": {
+                                    "showUnits": false,
+                                    "label": "count"
+                                }
+                            }
+                        }
+                    },	
+                    {
+                        "height": 7,
+                        "width": 24,
+                        "y": 70,
+                        "x": 0,
+                        "type": "metric",
+                        "properties": {
+                            "metrics": [
+                                [ { "expression": "SORT([e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17],MAX,DESC,10)", "label": "[${!PROP('Region')}] ${!LABEL}", "id": "s1" } ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e1", "period": 300, "region": "us-east-1" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e2", "period": 300, "region": "us-east-2" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e3", "period": 300, "region": "us-west-1" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e4", "period": 300, "region": "us-west-2" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e5", "period": 300, "region": "ca-central-1" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e6", "period": 300, "region": "ap-south-1" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e7", "period": 300, "region": "ap-northeast-1" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e8", "period": 300, "region": "ap-northeast-2" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e9", "period": 300, "region": "ap-northeast-3" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e10", "period": 300, "region": "ap-southeast-1" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e11", "period": 300, "region": "ap-southeast-2" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e12", "period": 300, "region": "eu-central-1" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e13", "period": 300, "region": "eu-west-1" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e14", "period": 300, "region": "eu-west-2" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e15", "period": 300, "region": "eu-west-3" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e16", "period": 300, "region": "eu-north-1" , "visible": false} ],
+                                [ { "expression": "SORT(SEARCH('{AWS/Usage,Class,Resource,Service,Type} Service=\"CloudWatch\" Type=\"API\"', 'Sum', 300),MAX,DESC,10)", "id": "e17", "period": 300, "region": "sa-east-1" , "visible": false} ]
+                            ],
+                            "view": "timeSeries",
+                            "stacked": false,
+                            "region": "${AWS::Region}",
+                            "stat": "Average",
+                            "period": 300,
+                            "legend": {
+                                    "position": "right"
+                                },
+                            "title": "CloudWatch API Call Volume - top 10 across all Regions"
+                        }
+                    }
+                ]
+            }
