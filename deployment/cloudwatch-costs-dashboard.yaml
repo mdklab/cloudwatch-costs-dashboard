@@ -1,0 +1,5 @@
+template-file-path: cloudformation-usage-cloudwatchv2.yaml
+parameters:
+  TagName: environment
+  TagValue: SHARED
+tags: {}
