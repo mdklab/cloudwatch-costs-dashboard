@@ -221,7 +221,7 @@ Resources:
       Handler: index.handler
       MemorySize: 128
       Role: !GetAtt LambdaIAMRole1.Arn
-      Runtime: nodejs16.x
+      Runtime: nodejs22.x
       Timeout: 60
       Tags:
         - Key: !Ref TagName
@@ -423,7 +423,7 @@ Resources:
       Handler: index.handler
       MemorySize: 128
       Role: !GetAtt LambdaIAMRole2.Arn
-      Runtime: nodejs16.x
+      Runtime: nodejs22.x
       Timeout: 60
       Tags:
         - Key: !Ref TagName
