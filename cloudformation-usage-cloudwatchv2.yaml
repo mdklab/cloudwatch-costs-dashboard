@@ -21,7 +21,7 @@ Resources:
       Code:
         ZipFile: |
             // CloudWatch Custom Widget: display Cost Explorer report
-            const aws = require('aws-sdk');
+            const { CostExplorerClient, GetCostAndUsageCommand } = require("@aws-sdk/client-cost-explorer");
 
             const DOCS = `## Display Cost Explorer report
             Displays a report for the specified service, showing costs for the specified service, for selected time range grouped by displayType.
@@ -77,7 +77,7 @@ Resources:
 
             const getResults = async (start, end, displayType, service, dataType) => {
                 // https://aws.amazon.com/premiumsupport/knowledge-center/cloudwatch-understand-and-reduce-charges/
-                const ce = new aws.CostExplorer({ region: 'us-east-1' });
+                const ce = new CostExplorerClient({ region: "us-east-1" });
                 let NextPageToken = null;
                 let costs = [];
                 
@@ -105,11 +105,12 @@ Resources:
                     };
                     // https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/CostExplorer.html#getCostAndUsage-property
 
-                    const response = await ce.getCostAndUsage(params).promise();
+                    const command = new GetCostAndUsageCommand(params);
+                    const response = await ce.send(command);
 
                     // console.log(response);
 
-                    costs = costs.concat(response.ResultsByTime);
+                    costs = costs.concat(response.ResultsByTime || []);
                     NextPageToken = response.NextPageToken;
                 } while (NextPageToken);
 
@@ -138,23 +139,23 @@ Resources:
 
                 let totalData = 0;
                 costResults.forEach(result => {
-                    result.Groups.forEach(group => {
+                    (result.Groups || []).forEach(group => {
                         const groupValue = group.Keys[0];
                         // filter the data if a filter was provided
                         // a filter can have multiple, space separated values
                         for(let optionalFilterItem of optionalFilter.split(" ")){
                             if (!optionalFilterItem || groupValue.indexOf(optionalFilterItem) > -1) {
                                 let groupCost = scs[groupValue] || 0;
-                                let currentDayCost = parseFloat(group.Metrics[dataType].Amount) || 0;
+                                const currentDayCost = parseFloat(group.Metrics[dataType].Amount) || 0;
                                 totalData += currentDayCost;
-                                groupCost += parseFloat(group.Metrics[dataType].Amount);
+                                groupCost += currentDayCost;
                                 scs[groupValue] = groupCost;
                             }
                         }
                     });
                 });
                 const sortedscs = Object.entries(scs).sort(([,a],[,b]) => b-a);
-                const maxgroupData = Math.max(...sortedscs.map(cost => cost[1]));
+                const maxgroupData = sortedscs.length > 0 ? Math.max(...sortedscs.map(cost => cost[1])) : 0;
                 return { totalData, groupData: sortedscs, maxgroupData };
             };
 
@@ -170,8 +171,8 @@ Resources:
 
                 groupData.forEach((groupEntry, i) => {
                     const [ UsageType, UsageTypeData ] = groupEntry;
-                    const percent = (UsageTypeData / totalData * 100).toFixed(2);
-                    const maxPercent = (UsageTypeData / maxgroupData * 100).toFixed(2);
+                    const percent = totalData > 0 ? (UsageTypeData / totalData * 100).toFixed(2) : 0;
+                    const maxPercent = maxgroupData > 0 ? (UsageTypeData / maxgroupData * 100).toFixed(2) : 0;
                     const color = PALETTE[i % PALETTE.length];
                     html += `
                         <tr>
@@ -234,7 +235,7 @@ Resources:
       Code:
         ZipFile: |
             // CloudWatch Custom Widget: display CloudWatch log storage
-            const aws = require('aws-sdk');
+            const { CloudWatchLogsClient, DescribeLogGroupsCommand } = require("@aws-sdk/client-cloudwatch-logs");
 
             const DOCS = `## Display CloudWatch log Volume stored
             Displays a report on volume (GB) of each CloudWatch log group for the selected time range.`;
@@ -292,24 +293,27 @@ Resources:
             const addRegionToLogGroups = (region, logGroups) => {
                 logGroups.forEach(logGroup => {
                     logGroup.region = region;
-                })
-            }
+                });
+            };
 
             // get data about all logs in each region
             const getLogGroups = async (region) => {
                 // region defines the region we will get results from
-                const cwl = new aws.CloudWatchLogs({ region: region });
+                const cwl = new CloudWatchLogsClient({ region });
                 let NextPageToken = null;
                 let logGroups = [];
 
                 // get list of all logGroups and loop through paginated response until no next page token
                 do {
-                    const params = { nextToken: NextPageToken }; // don't specify the logGroupNamePrefix and will return all log groups
-                    // https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/CloudWatchLogs.html#describeLogGroups-property
-                    const response = await cwl.describeLogGroups(params).promise();
+                    const params = {};
+                    if (NextPageToken) {
+                        params.nextToken = NextPageToken;
+                    }
                     
-                    // combine results into a single array
-                    logGroups = logGroups.concat(response.logGroups);
+                    const command = new DescribeLogGroupsCommand(params);
+                    const response = await cwl.send(command);
+
+                    logGroups = logGroups.concat(response.logGroups || []);
                     NextPageToken = response.nextToken;
                 } while (NextPageToken);
                 
@@ -335,7 +339,7 @@ Resources:
 
                 // go through each log group and get storage volume
                 logGroups.forEach(result => {
-                    totalVolumeBytes += result.storedBytes;
+                    totalVolumeBytes += result.storedBytes || 0;
                     
                     // log group names have to be unique within a region, so create unique id to allow multi region search
                     const logGroupId = `${result.logGroupName}:${result.region}`;
@@ -344,7 +348,7 @@ Resources:
                     logGroupRegionVolume.push( { 
                         id: logGroupId, 
                         name: result.logGroupName, 
-                        GB: result.storedBytes / 1000000000, 
+                        GB: (result.storedBytes || 0) / 1000000000,
                         region: result.region 
                     } );
                 });
@@ -356,17 +360,21 @@ Resources:
             // we only want top 10 overall - use this to get top 10 by region, and overall
             const getTopXByVolume = (logGroups, size) => {
                 if (logGroups.length < size) {
-                    size = logGroups.length
+                    size = logGroups.length;
                 }
                 
                 // sort by cost, largest to smallest              
                 const sortedLogGroups = logGroups.sort((a,b) => b.GB - a.GB);
 
                 return sortedLogGroups.slice(0, size);
-            }
+            };
 
             // for HTML output display: create table for the bar/table display
             const getLogGroupsHtml = (totalVolumeGB, sortedLogGroupsRegion) => {
+                if (sortedLogGroupsRegion.length === 0) {
+                    return tableStart(totalVolumeGB) + "<tbody></tbody></table>";
+                }
+
                 // find max (so we can display results in relation to max value)
                 const maxLogVolumeGB = sortedLogGroupsRegion[0].GB;
 
@@ -377,8 +385,8 @@ Resources:
                     const logGroupName = logGroupEntry.name;
                     const logGroupRegion = logGroupEntry.region;
                     const logGroupVolume = logGroupEntry.GB;
-                    const percent = (logGroupVolume / totalVolumeGB * 100).toFixed(2);
-                    const maxPercent = ( logGroupVolume / maxLogVolumeGB * 100).toFixed(2);
+                    const percent = totalVolumeGB > 0 ? (logGroupVolume / totalVolumeGB * 100).toFixed(2) : 0;
+                    const maxPercent = maxLogVolumeGB > 0 ? (logGroupVolume / maxLogVolumeGB * 100).toFixed(2) : 0;
                     const color = PALETTE[i % PALETTE.length];
                     html += `<tr>
                                 <td>${logGroupName}</td>
@@ -395,7 +403,6 @@ Resources:
                 if (event.describe) {
                     return DOCS;
                 }
-                let result = false;
                 let mylogGroups = [];
                 let myRegionlogGroupsVolume = [];
                 let mylogGroupsVolume = [];
